@@ -177,6 +177,51 @@ kv "Report file" "$LOG"
 kv "Start time" "$START_TS"
 kv "End time"   "$(date -Is)"
 
+section "11) Upload to GCS"
+
+BUCKET="gs://dito-preflight"
+KEY_PATH="/tmp/dito-bucket-sa-key.json"
+
+# Verify key exists
+if [ ! -f "$KEY_PATH" ]; then
+  echo "  - ERROR: Service account key not found at $KEY_PATH"
+  echo "    Please copy dito-bucket-sa-key.json to $KEY_PATH"
+  exit 1
+fi
+
+# Set credentials for gsutil
+export GOOGLE_APPLICATION_CREDENTIALS="$KEY_PATH"
+
+# Ensure gsutil is installed
+if ! command -v gsutil >/dev/null 2>&1; then
+  echo "  - Installing Google Cloud CLI (for gsutil)"
+  tee /etc/yum.repos.d/google-cloud-sdk.repo >/dev/null <<'EOF'
+[google-cloud-cli]
+name=Google Cloud CLI
+baseurl=https://packages.cloud.google.com/yum/repos/cloud-sdk-el9-x86_64
+enabled=1
+gpgcheck=1
+repo_gpgcheck=0
+gpgkey=https://packages.cloud.google.com/yum/doc/yum-key.gpg https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
+EOF
+  dnf install -y -q google-cloud-cli
+fi
+
+# Upload the report file
+if [ -f "$LOG" ]; then
+  echo "  - Uploading report to $BUCKET"
+  gsutil cp "$LOG" "$BUCKET/"
+  if [ $? -eq 0 ]; then
+    echo "  - Uploaded successfully."
+    echo "  - Public URL: https://storage.googleapis.com/dito-preflight/$(basename "$LOG")"
+  else
+    echo "  - Upload failed."
+  fi
+else
+  echo "  - ERROR: Report file not found ($LOG)"
+fi
+
+
 # Optional: emit a tiny JSON summary if jq is present
 if have jq; then
   JSON=$(jq -n \
