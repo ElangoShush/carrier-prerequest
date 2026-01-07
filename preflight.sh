@@ -1,42 +1,57 @@
 #!/usr/bin/env bash
-# preflight.sh — VM/Kubernetes pre-request checks + upload report to a carrier-specific GCS bucket
+# preflight.sh — VM/Kubernetes pre-request checks + upload report to GCS via Signed URL (no SA key on servers)
 #
 # Usage:
-#   sudo ./preflight.sh <carrier-name> [--quick]
-#   sudo ./preflight.sh --quick <carrier-name>
-#   CARRIER_NAME=<carrier-name> sudo ./preflight.sh [--quick]
+#   sudo ./preflight.sh <carrier-name> [--quick] [--upload-url <SIGNED_PUT_URL>]
+#   sudo ./preflight.sh --quick <carrier-name> --upload-url <SIGNED_PUT_URL>
+#   CARRIER_NAME=<carrier-name> UPLOAD_URL=<SIGNED_PUT_URL> sudo ./preflight.sh [--quick]
 #
-# Examples:
-#   sudo ./preflight.sh abcd
-#   sudo ./preflight.sh abcd --quick
-#   sudo ./preflight.sh --quick abcd
-#   CARRIER_NAME=abcd sudo ./preflight.sh
+# Notes:
+# - The SIGNED_PUT_URL must be a V4 signed URL that allows HTTP PUT.
+# - The Content-Type used for signing must match what we send (default: text/plain).
+# - No gsutil/gcloud/service-account key is needed on the server.
 
 set -Eeuo pipefail
 
-# -----------------------------
-# Arg parsing
-# -----------------------------
 QUICK=0
 RAW_CARRIER_NAME="${CARRIER_NAME:-}"
+UPLOAD_URL="${UPLOAD_URL:-}"
+CONTENT_TYPE="${UPLOAD_CONTENT_TYPE:-text/plain}"  # must match what was used when signing
 
 usage() {
-  echo "Usage: $0 <carrier-name> [--quick]"
-  echo "       $0 --quick <carrier-name>"
-  echo "       CARRIER_NAME=<carrier-name> $0 [--quick]"
+  echo "Usage: $0 <carrier-name> [--quick] [--upload-url <SIGNED_PUT_URL>]"
+  echo "       $0 --quick <carrier-name> --upload-url <SIGNED_PUT_URL>"
+  echo "       CARRIER_NAME=<carrier-name> UPLOAD_URL=<SIGNED_PUT_URL> $0 [--quick]"
+  echo
+  echo "Env:"
+  echo "  UPLOAD_URL               Signed PUT URL"
+  echo "  UPLOAD_CONTENT_TYPE      Default: text/plain (must match signed headers)"
 }
 
-# Parse args (allow --quick before/after)
-for arg in "$@"; do
-  case "$arg" in
-    --quick) QUICK=1 ;;
+# Parse args (allow flags in any order)
+ARGS=("$@")
+i=0
+while [[ $i -lt ${#ARGS[@]} ]]; do
+  case "${ARGS[$i]}" in
+    --quick)
+      QUICK=1
+      ;;
+    --upload-url)
+      i=$((i+1))
+      UPLOAD_URL="${ARGS[$i]:-}"
+      ;;
+    -*)
+      echo "Unknown flag: ${ARGS[$i]}"
+      usage
+      exit 1
+      ;;
     *)
-      # first non-flag becomes carrier name (unless already set via env)
       if [[ -z "${RAW_CARRIER_NAME}" ]]; then
-        RAW_CARRIER_NAME="$arg"
+        RAW_CARRIER_NAME="${ARGS[$i]}"
       fi
       ;;
   esac
+  i=$((i+1))
 done
 
 if [[ -z "${RAW_CARRIER_NAME}" ]]; then
@@ -44,11 +59,7 @@ if [[ -z "${RAW_CARRIER_NAME}" ]]; then
   exit 1
 fi
 
-# Sanitize carrier name into a valid GCS bucket suffix:
-# - lowercase
-# - only a-z, 0-9, hyphen
-# - collapse repeated hyphens
-# - trim leading/trailing hyphens
+# Sanitize carrier name
 CARRIER_NAME_SANITIZED=$(
   echo "$RAW_CARRIER_NAME" \
     | tr '[:upper:]' '[:lower:]' \
@@ -63,15 +74,7 @@ if [[ -z "$CARRIER_NAME_SANITIZED" ]]; then
   exit 1
 fi
 
-# Bucket config (bucket names are globally unique)
-PROJECT_PREFIX="dito-preflight"
-BUCKET_NAME="${PROJECT_PREFIX}-${CARRIER_NAME_SANITIZED}"
-BUCKET="gs://${BUCKET_NAME}"
-BUCKET_LOCATION="us-central1"
-
-# -----------------------------
 # Logging
-# -----------------------------
 LOG="/tmp/preflight_$(hostname)_$(date +%F_%H%M%S).txt"
 exec > >(tee -a "$LOG") 2>&1
 
@@ -85,9 +88,9 @@ START_TS=$(date -Is)
 section "0) Run context"
 kv "Raw carrier name"   "$RAW_CARRIER_NAME"
 kv "Sanitized carrier"  "$CARRIER_NAME_SANITIZED"
-kv "Upload bucket"      "$BUCKET"
-kv "Bucket location"    "$BUCKET_LOCATION"
 kv "Quick mode"         "$QUICK"
+kv "Upload URL provided" "$([[ -n "${UPLOAD_URL}" ]] && echo yes || echo no)"
+kv "Upload Content-Type" "$CONTENT_TYPE"
 
 section "1) Host & OS"
 OS_NAME="$(. /etc/os-release && echo "$PRETTY_NAME")"
@@ -116,7 +119,6 @@ echo
 echo "  - Default route(s):"
 ip route | sed 's/^/    /'
 
-# Detect default egress and source
 SRC_IP=""
 DEV_IF=""
 GW_IP=""
@@ -140,7 +142,6 @@ for D in "${PING_DESTS[@]}"; do
   fi
 done
 
-# DNS resolution test
 DNS_TEST_HOST="www.google.com"
 if have getent && getent hosts "$DNS_TEST_HOST" >/dev/null 2>&1; then
   kv "DNS resolve $DNS_TEST_HOST" "OK ($(getent hosts $DNS_TEST_HOST | awk '{print $1}' | paste -sd, -))"
@@ -148,7 +149,6 @@ else
   kv "DNS resolve $DNS_TEST_HOST" "FAIL"
 fi
 
-# HTTP/HTTPS egress
 for URL in "http://example.com" "https://example.com"; do
   if have curl && curl -fsSL --max-time 5 -o /dev/null "$URL"; then
     kv "HTTP check $URL" "OK"
@@ -157,7 +157,6 @@ for URL in "http://example.com" "https://example.com"; do
   fi
 done
 
-# Cloud metadata reachability (often present in clouds)
 if ping -W1 -c1 169.254.169.254 >/dev/null 2>&1; then
   kv "Metadata 169.254.169.254" "reachable"
 else
@@ -176,20 +175,17 @@ PKG_MGR="unknown"
 if have dnf; then PKG_MGR="dnf"; elif have yum; then PKG_MGR="yum"; elif have apt; then PKG_MGR="apt"; fi
 kv "Package manager" "$PKG_MGR"
 
-# Count installed packages (RPM/DPKG)
 if have rpm; then
   kv "Installed packages (rpm -qa)" "$(rpm -qa | wc -l)"
 elif have dpkg-query; then
   kv "Installed packages (dpkg)" "$(dpkg-query -f '.' -W 2>/dev/null | wc -c)"
 fi
 
-# Important tools presence
-TOOLS=(git curl wget tar unzip zip helm kubectl kubeadm k3s docker podman containerd crictl nerdctl mysql psql jq traceroute gsutil)
+TOOLS=(git curl wget tar unzip zip helm kubectl kubeadm k3s docker podman containerd crictl nerdctl mysql psql jq traceroute)
 for t in "${TOOLS[@]}"; do
   have "$t" && kv "tool:$t" "yes" || kv "tool:$t" "no"
 done
 
-# Docker/podman services
 kv "docker.service" "$(svc_active docker)"
 kv "containerd.service" "$(svc_active containerd 2>/dev/null || true)"
 kv "crio.service" "$(svc_active crio 2>/dev/null || true)"
@@ -260,64 +256,52 @@ kv "Report file" "$LOG"
 kv "Start time" "$START_TS"
 kv "End time"   "$(date -Is)"
 
-# -----------------------------
-# Upload to GCS (carrier bucket)
-# -----------------------------
-section "11) Upload to GCS (carrier bucket)"
+section "11) Upload to GCS via Signed URL (no key needed)"
 
-KEY_PATH="/tmp/dito-bucket-sa-key.json"
-
-# Verify key exists
-if [[ ! -f "$KEY_PATH" ]]; then
-  echo "  - ERROR: Service account key not found at $KEY_PATH"
-  echo "    Please copy dito-bucket-sa-key.json to $KEY_PATH"
-  exit 1
+if [[ -z "${UPLOAD_URL}" ]]; then
+  echo "  - SKIP: UPLOAD_URL not provided."
+  echo "    Provide it via:"
+  echo "      UPLOAD_URL='https://storage.googleapis.com/...' sudo ./preflight.sh ${CARRIER_NAME_SANITIZED}"
+  echo "    or:"
+  echo "      sudo ./preflight.sh ${CARRIER_NAME_SANITIZED} --upload-url 'https://storage.googleapis.com/...'"
+  exit 0
 fi
 
-# Set credentials for gsutil / gcloud
-export GOOGLE_APPLICATION_CREDENTIALS="$KEY_PATH"
+have curl || { echo "  - ERROR: curl is required for upload"; exit 1; }
 
-# Ensure gsutil is installed (RHEL/Rocky)
-if ! command -v gsutil >/dev/null 2>&1; then
-  echo "  - Installing Google Cloud CLI (for gsutil)"
-  tee /etc/yum.repos.d/google-cloud-sdk.repo >/dev/null <<'EOF'
-[google-cloud-cli]
-name=Google Cloud CLI
-baseurl=https://packages.cloud.google.com/yum/repos/cloud-sdk-el9-x86_64
-enabled=1
-gpgcheck=1
-repo_gpgcheck=0
-gpgkey=https://packages.cloud.google.com/yum/doc/yum-key.gpg https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
-EOF
-  dnf install -y -q google-cloud-cli
-fi
-
-# Ensure bucket exists (create if missing)
-# NOTE: Bucket names are GLOBAL. If someone else already owns the name, creation will fail.
-if ! gsutil ls -b "$BUCKET" >/dev/null 2>&1; then
-  echo "  - Bucket does not exist (or no access). Creating $BUCKET in $BUCKET_LOCATION"
-  gsutil mb -l "$BUCKET_LOCATION" "$BUCKET" || {
-    echo "  - ERROR: Failed to create bucket $BUCKET"
-    echo "    This can happen if the bucket name is already taken globally, or SA lacks permissions."
-    exit 1
-  }
-fi
-
-# Upload the report file
-if [[ -f "$LOG" ]]; then
-  echo "  - Uploading report to $BUCKET"
-  gsutil cp "$LOG" "$BUCKET/" || {
-    echo "  - Upload failed."
-    exit 1
-  }
-  echo "  - Uploaded successfully."
-  echo "  - Public URL (only if bucket/object is public): https://storage.googleapis.com/${BUCKET_NAME}/$(basename "$LOG")"
-else
+if [[ ! -f "$LOG" ]]; then
   echo "  - ERROR: Report file not found ($LOG)"
   exit 1
 fi
 
-# Optional: emit a tiny JSON summary if jq is present
+echo "  - Uploading report using HTTP PUT..."
+echo "  - Upload URL host: $(echo "$UPLOAD_URL" | awk -F/ '{print $3}')"
+echo "  - File: $LOG"
+
+HTTP_CODE=$(
+  curl -sS -o /tmp/preflight_upload_response.txt \
+    -w "%{http_code}" \
+    -X PUT \
+    -H "Content-Type: ${CONTENT_TYPE}" \
+    --upload-file "$LOG" \
+    "$UPLOAD_URL" || echo "000"
+)
+
+if [[ "$HTTP_CODE" =~ ^2 ]]; then
+  echo "  - Uploaded successfully (HTTP $HTTP_CODE)."
+else
+  echo "  - Upload FAILED (HTTP $HTTP_CODE). Response:"
+  sed 's/^/    /' /tmp/preflight_upload_response.txt || true
+  echo
+  echo "  - Common causes:"
+  echo "    1) Signed URL expired"
+  echo "    2) Content-Type mismatch (must match what was used during signing)"
+  echo "    3) URL was signed for a different HTTP verb (must be PUT)"
+  echo "    4) URL signed for a different object name/path"
+  exit 1
+fi
+
+# Optional: JSON summary
 if have jq; then
   JSON=$(jq -n \
     --arg host "$(hostname -f 2>/dev/null || hostname)" \
@@ -327,8 +311,7 @@ if have jq; then
     --arg dev_if "${DEV_IF:-}" \
     --arg gw_ip  "${GW_IP:-}" \
     --arg carrier "${CARRIER_NAME_SANITIZED}" \
-    --arg bucket "${BUCKET}" \
-    '{host:$host,os:$os,kernel:$kernel,carrier:$carrier,bucket:$bucket,network:{source_ip:$src_ip,egress_if:$dev_if,gateway:$gw_ip}}')
+    '{host:$host,os:$os,kernel:$kernel,carrier:$carrier,network:{source_ip:$src_ip,egress_if:$dev_if,gateway:$gw_ip}}')
   section "JSON summary (compact)"
   echo "    $JSON"
 fi
